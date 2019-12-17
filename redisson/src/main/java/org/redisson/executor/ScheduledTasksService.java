@@ -1,5 +1,5 @@
 /**
- * Copyright 2018 Nikita Koksharov
+ * Copyright (c) 2013-2019 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,20 +17,19 @@ package org.redisson.executor;
 
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ThreadLocalRandom;
 
 import org.redisson.RedissonExecutorService;
 import org.redisson.api.RFuture;
-import org.redisson.api.RedissonClient;
 import org.redisson.client.codec.Codec;
 import org.redisson.client.codec.LongCodec;
 import org.redisson.client.codec.StringCodec;
 import org.redisson.client.protocol.RedisCommands;
 import org.redisson.command.CommandExecutor;
+import org.redisson.executor.params.ScheduledParameters;
 import org.redisson.remote.RemoteServiceRequest;
 import org.redisson.remote.RequestId;
 import org.redisson.remote.ResponseEntry;
-
-import io.netty.util.internal.PlatformDependent;
 
 /**
  * 
@@ -41,8 +40,8 @@ public class ScheduledTasksService extends TasksService {
 
     private RequestId requestId;
     
-    public ScheduledTasksService(Codec codec, RedissonClient redisson, String name, CommandExecutor commandExecutor, String redissonId, ConcurrentMap<String, ResponseEntry> responses) {
-        super(codec, redisson, name, commandExecutor, redissonId, responses);
+    public ScheduledTasksService(Codec codec, String name, CommandExecutor commandExecutor, String redissonId, ConcurrentMap<String, ResponseEntry> responses) {
+        super(codec, name, commandExecutor, redissonId, responses);
     }
     
     public void setRequestId(RequestId requestId) {
@@ -51,31 +50,29 @@ public class ScheduledTasksService extends TasksService {
     
     @Override
     protected RFuture<Boolean> addAsync(String requestQueueName, RemoteServiceRequest request) {
-        int requestIndex = 0;
-        if ("scheduleCallable".equals(request.getMethodName())
-                || "scheduleRunnable".equals(request.getMethodName())) {
-            requestIndex = 4;
-        }
-        if ("scheduleAtFixedRate".equals(request.getMethodName())
-                || "scheduleWithFixedDelay".equals(request.getMethodName())
-                    || "schedule".equals(request.getMethodName())) {
-            requestIndex = 6;
+        ScheduledParameters params = (ScheduledParameters) request.getArgs()[0];
+        params.setRequestId(request.getId());
+
+        long expireTime = 0;
+        if (params.getTtl() > 0) {
+            expireTime = System.currentTimeMillis() + params.getTtl();
         }
 
-        request.getArgs()[requestIndex] = request.getId();
-        Long startTime = (Long)request.getArgs()[3];
-        
         return commandExecutor.evalWriteAsync(name, LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 // check if executor service not in shutdown state
                 "if redis.call('exists', KEYS[2]) == 0 then "
                     + "local retryInterval = redis.call('get', KEYS[6]); "
                     + "if retryInterval ~= false then "
-                        + "local time = tonumber(ARGV[4]) + tonumber(retryInterval);"
+                        + "local time = tonumber(ARGV[1]) + tonumber(retryInterval);"
                         + "redis.call('zadd', KEYS[3], time, 'ff' .. ARGV[2]);"
-                    + "elseif tonumber(ARGV[5]) > 0 then "
-                        + "redis.call('set', KEYS[6], ARGV[5]);"
-                        + "local time = tonumber(ARGV[4]) + tonumber(ARGV[5]);"
+                    + "elseif tonumber(ARGV[4]) > 0 then "
+                        + "redis.call('set', KEYS[6], ARGV[4]);"
+                        + "local time = tonumber(ARGV[1]) + tonumber(ARGV[4]);"
                         + "redis.call('zadd', KEYS[3], time, 'ff' .. ARGV[2]);"
+                    + "end; "
+
+                    + "if tonumber(ARGV[5]) > 0 then "
+                        + "redis.call('zadd', KEYS[7], ARGV[5], ARGV[2]);"
                     + "end; "
 
                     + "redis.call('zadd', KEYS[3], ARGV[1], ARGV[2]);"
@@ -90,8 +87,9 @@ public class ScheduledTasksService extends TasksService {
                     + "return 1;"
                 + "end;"
                 + "return 0;", 
-                Arrays.<Object>asList(tasksCounterName, statusName, schedulerQueueName, schedulerChannelName, tasksName, tasksRetryIntervalName),
-                startTime, request.getId(), encode(request), System.currentTimeMillis(), tasksRetryInterval);
+                Arrays.asList(tasksCounterName, statusName, schedulerQueueName,
+                        schedulerChannelName, tasksName, tasksRetryIntervalName, tasksExpirationTimeName),
+                params.getStartTime(), request.getId(), encode(request), tasksRetryInterval, expireTime);
     }
     
     @Override
@@ -112,8 +110,9 @@ public class ScheduledTasksService extends TasksService {
                   // remove from executor queue
                   + "if task ~= false and (removed > 0 or removedScheduled > 0) then "
                       + "if redis.call('decr', KEYS[3]) == 0 then "
-                         + "redis.call('del', KEYS[3], KEYS[7]);"
+                         + "redis.call('del', KEYS[3]);"
                          + "if redis.call('get', KEYS[4]) == ARGV[2] then "
+                            + "redis.call('del', KEYS[7]);"
                             + "redis.call('set', KEYS[4], ARGV[3]);"
                             + "redis.call('publish', KEYS[5], ARGV[3]);"
                          + "end;"
@@ -129,12 +128,20 @@ public class ScheduledTasksService extends TasksService {
     }
     
     @Override
+    protected long getTimeout(Long executionTimeoutInMillis, RemoteServiceRequest request) {
+        if (request.getArgs()[0].getClass() == ScheduledParameters.class) {
+            ScheduledParameters params = (ScheduledParameters) request.getArgs()[0];
+            return executionTimeoutInMillis + params.getStartTime() - System.currentTimeMillis();
+        }
+        return executionTimeoutInMillis;
+    }
+    
+    @Override
     protected RequestId generateRequestId() {
         if (requestId == null) {
             byte[] id = new byte[17];
-            // TODO JDK UPGRADE replace to native ThreadLocalRandom
-            PlatformDependent.threadLocalRandom().nextBytes(id);
-            id[0] = 1;
+            ThreadLocalRandom.current().nextBytes(id);
+            id[0] = 01;
             return new RequestId(id);
         }
         return requestId;
